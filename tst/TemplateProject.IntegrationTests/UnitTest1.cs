@@ -1,6 +1,10 @@
+using System.Net;
+
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
+
+using Shouldly;
 
 using TemplateProject.Api;
 namespace TemplateProject.IntegrationTests;
@@ -19,14 +23,24 @@ public class WebApplicationFixture : WebApplicationFactory<Program>
         });
     }
 }
-public class UnitTest1 : WebApplicationFixture
+public class PingEndpointTests : IClassFixture<WebApplicationFixture>
 {
-    [Fact]
-    public async Task Test1()
+    private readonly HttpClient _client;
+
+    public PingEndpointTests(WebApplicationFixture factory)
     {
-        var webApplication = new WebApplicationFactory<Program>();
-        var client = webApplication.CreateClient();
-        var response = await client.GetAsync("/health");
-        response.EnsureSuccessStatusCode();
+        _client = factory.CreateClient();
+    }
+
+    [Fact]
+    public async Task Ping_ShouldReturnPong()
+    {
+        // Act
+        var response = await _client.GetAsync("/ping");
+        var content = await response.Content.ReadAsStringAsync();
+
+        // Assert
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        content.ShouldBe("pong");
     }
 }
