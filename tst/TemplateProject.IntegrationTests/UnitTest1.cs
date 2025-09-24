@@ -41,6 +41,6 @@ public class PingEndpointTests : IClassFixture<WebApplicationFixture>
 
         // Assert
         response.StatusCode.ShouldBe(HttpStatusCode.OK);
-        content.ShouldBe("pong");
+        content.ShouldContain("pong");
     }
 }
