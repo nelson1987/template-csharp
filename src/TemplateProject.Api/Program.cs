@@ -4,8 +4,8 @@ builder.Services.AddHealthChecks();
 var app = builder.Build();
 app.UseHttpsRedirection();
 app.UseHealthChecks("/health");
-app.MapGet("/test", () =>
+app.MapGet("/ping", () =>
 {
-    return Results.Ok("Hello World!");
+    return Results.Ok("pong");
 });
 app.Run();
