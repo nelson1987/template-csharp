@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.TestHost;
 using Shouldly;
 
 using TemplateProject.Api;
+
 namespace TemplateProject.IntegrationTests;
 
 public class WebApplicationFixture : WebApplicationFactory<Program>
@@ -17,6 +18,7 @@ public class WebApplicationFixture : WebApplicationFactory<Program>
         builder
         .UseEnvironment("Testing")
         //.UseSetting("https_port", "5001")
+        .UseSetting("JWT_SECRET", "integration_secret_1234567890")
         .ConfigureTestServices(services =>
         {
             // customize test services
