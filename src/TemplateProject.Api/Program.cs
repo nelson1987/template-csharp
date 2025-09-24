@@ -8,4 +8,8 @@ app.MapGet("/ping", () =>
 {
     return Results.Ok("pong");
 });
-app.Run();
+await app.RunAsync();
+namespace TemplateProject.Api
+{
+    public partial class Program { }
+}
