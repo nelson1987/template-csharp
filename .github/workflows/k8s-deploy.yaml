@@ -1,0 +1,625 @@
+# .github/workflows/argocd-deploy.yml
+name: ArgoCD Multi-Environment Deploy
+
+on:
+  pull_request:
+    branches:
+      - main
+      - staging
+      - develop
+    types: [opened, synchronize, reopened, closed, edited]
+  
+  push:
+    branches:
+      - main
+      - staging
+      - develop
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  packages: write
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  PROJECT_PATH: './src/TemplateProject.Api/TemplateProject.Api.csproj'
+  TEST_PATH: './tst/TemplateProject.Api.Tests/TemplateProject.Api.Tests.csproj'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Job 1: Build, Test e Build Docker Image
+  build-and-test:
+    name: Build, Test & Docker Build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Executar testes unitários
+        run: dotnet test --no-build --verbosity normal --configuration Release
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build Docker Image (não faz push em PR)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Job 2: Gerenciar PRs em Cascata
+  manage-cascade-prs:
+    name: Gerenciar PRs em Cascata
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: |
+      github.event_name == 'pull_request' && 
+      github.base_ref == 'main' && 
+      (github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened')
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Configurar Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Verificar PRs existentes
+        uses: actions/github-script@v7
+        id: check_existing
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const branchName = context.payload.pull_request.head.ref;
+            const prNumber = context.payload.pull_request.number;
+            
+            const { data: allPrs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+            
+            const stagingPR = allPrs.find(pr => 
+              pr.head.ref === `staging-from-${branchName}` && 
+              pr.base.ref === 'staging' &&
+              pr.labels.some(label => label.name === 'auto-created')
+            );
+            
+            const developPR = allPrs.find(pr => 
+              pr.head.ref === `develop-from-${branchName}` && 
+              pr.base.ref === 'develop' &&
+              pr.labels.some(label => label.name === 'auto-created')
+            );
+            
+            let stagingMerged = stagingPR && stagingPR.merged_at;
+            let developMerged = developPR && developPR.merged_at;
+            
+            core.setOutput('staging_pr_number', stagingPR ? stagingPR.number : '');
+            core.setOutput('develop_pr_number', developPR ? developPR.number : '');
+            core.setOutput('staging_merged', stagingMerged);
+            core.setOutput('develop_merged', developMerged);
+
+      - name: Atualizar ou criar branch staging
+        id: staging
+        run: |
+          BRANCH_NAME="${{ github.head_ref }}"
+          STAGING_BRANCH="staging-from-${BRANCH_NAME}"
+          
+          git fetch origin staging
+          git fetch origin $BRANCH_NAME
+          
+          if git ls-remote --heads origin $STAGING_BRANCH | grep -q $STAGING_BRANCH; then
+            git checkout -B $STAGING_BRANCH origin/$STAGING_BRANCH
+          else
+            git checkout -B $STAGING_BRANCH origin/staging
+          fi
+          
+          git merge origin/$BRANCH_NAME --no-ff -m "chore: sync $BRANCH_NAME into staging" || {
+            git merge --abort || true
+            git checkout -B $STAGING_BRANCH origin/staging
+            git merge origin/$BRANCH_NAME --no-ff --strategy-option=theirs -m "chore: sync $BRANCH_NAME into staging"
+          }
+          
+          git push origin $STAGING_BRANCH --force
+          echo "staging_branch=$STAGING_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Atualizar ou criar branch develop
+        id: develop
+        run: |
+          BRANCH_NAME="${{ github.head_ref }}"
+          DEVELOP_BRANCH="develop-from-${BRANCH_NAME}"
+          
+          git fetch origin develop
+          git fetch origin $BRANCH_NAME
+          
+          if git ls-remote --heads origin $DEVELOP_BRANCH | grep -q $DEVELOP_BRANCH; then
+            git checkout -B $DEVELOP_BRANCH origin/$DEVELOP_BRANCH
+          else
+            git checkout -B $DEVELOP_BRANCH origin/develop
+          fi
+          
+          git merge origin/$BRANCH_NAME --no-ff -m "chore: sync $BRANCH_NAME into develop" || {
+            git merge --abort || true
+            git checkout -B $DEVELOP_BRANCH origin/develop
+            git merge origin/$BRANCH_NAME --no-ff --strategy-option=theirs -m "chore: sync $BRANCH_NAME into develop"
+          }
+          
+          git push origin $DEVELOP_BRANCH --force
+          echo "develop_branch=$DEVELOP_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Criar ou atualizar PR para Staging
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const branchName = context.payload.pull_request.head.ref;
+            const stagingBranch = '${{ steps.staging.outputs.staging_branch }}';
+            const prNumber = context.payload.pull_request.number;
+            const stagingPRNumber = '${{ steps.check_existing.outputs.staging_pr_number }}';
+            const stagingMerged = '${{ steps.check_existing.outputs.staging_merged }}' === 'true';
+            
+            const prBody = `## 🟡 Deploy para Staging via ArgoCD
+            
+            Este PR foi criado/atualizado automaticamente a partir de: #${prNumber}
+            
+            **Branch original:** \`${branchName}\`
+            **Autor:** @${{ github.event.pull_request.user.login }}
+            **Última atualização:** ${new Date().toISOString()}
+            
+            ### 🚀 Deploy automático:
+            Após merge, ArgoCD irá:
+            - Build da imagem Docker
+            - Push para GHCR
+            - Atualização dos manifestos Kubernetes
+            - Sincronização automática no cluster staging
+            
+            ${stagingMerged ? '⚠️ **NOVO PR criado após merge anterior**\n\n' : ''}`;
+            
+            if (stagingPRNumber && !stagingMerged) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: parseInt(stagingPRNumber),
+                body: prBody
+              });
+            } else {
+              const { data: newPR } = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🟡 [STAGING] ${{ github.event.pull_request.title }}`,
+                head: stagingBranch,
+                base: 'staging',
+                body: prBody
+              });
+              
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: newPR.number,
+                labels: ['staging', 'auto-created', `source-pr-${prNumber}`, 'argocd']
+              });
+            }
+
+      - name: Criar ou atualizar PR para Develop
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const branchName = context.payload.pull_request.head.ref;
+            const developBranch = '${{ steps.develop.outputs.develop_branch }}';
+            const prNumber = context.payload.pull_request.number;
+            const developPRNumber = '${{ steps.check_existing.outputs.develop_pr_number }}';
+            const developMerged = '${{ steps.check_existing.outputs.develop_merged }}' === 'true';
+            
+            const prBody = `## 🟢 Deploy para Develop via ArgoCD
+            
+            Este PR foi criado/atualizado automaticamente a partir de: #${prNumber}
+            
+            **Branch original:** \`${branchName}\`
+            **Autor:** @${{ github.event.pull_request.user.login }}
+            **Última atualização:** ${new Date().toISOString()}
+            
+            ### 🚀 Deploy automático:
+            Após merge, ArgoCD irá:
+            - Build da imagem Docker
+            - Push para GHCR
+            - Atualização dos manifestos Kubernetes
+            - Sincronização automática no cluster develop
+            
+            ${developMerged ? '⚠️ **NOVO PR criado após merge anterior**\n\n' : ''}`;
+            
+            if (developPRNumber && !developMerged) {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: parseInt(developPRNumber),
+                body: prBody
+              });
+            } else {
+              const { data: newPR } = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🟢 [DEVELOP] ${{ github.event.pull_request.title }}`,
+                head: developBranch,
+                base: 'develop',
+                body: prBody
+              });
+              
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: newPR.number,
+                labels: ['develop', 'auto-created', `source-pr-${prNumber}`, 'argocd']
+              });
+            }
+
+  # Job 3: Merge Automático em Cascata
+  auto-merge-cascade:
+    name: Merge Automático em Cascata
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.base_ref == 'main'
+    
+    steps:
+      - name: Buscar e mergear PRs relacionados
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+            
+            const stagingPR = prs.find(pr => 
+              pr.labels.some(label => label.name === `source-pr-${prNumber}`) &&
+              pr.base.ref === 'staging'
+            );
+            
+            const developPR = prs.find(pr => 
+              pr.labels.some(label => label.name === `source-pr-${prNumber}`) &&
+              pr.base.ref === 'develop'
+            );
+            
+            let results = { staging: false, develop: false };
+            
+            if (stagingPR) {
+              try {
+                await github.rest.pulls.merge({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: stagingPR.number,
+                  merge_method: 'merge'
+                });
+                results.staging = true;
+              } catch (error) {
+                console.log(`Erro ao mergear staging: ${error.message}`);
+              }
+            }
+            
+            if (developPR) {
+              try {
+                await github.rest.pulls.merge({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: developPR.number,
+                  merge_method: 'merge'
+                });
+                results.develop = true;
+              } catch (error) {
+                console.log(`Erro ao mergear develop: ${error.message}`);
+              }
+            }
+            
+            await github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ✅ Deploy em Cascata - ArgoCD
+              
+              **Ambientes atualizados:**
+              - 🔴 **Main (Produção):** ✅ Merged
+              - 🟡 **Staging:** ${results.staging ? '✅ Merged - ArgoCD sincronizará' : '⚠️ Erro'}
+              - 🟢 **Develop:** ${results.develop ? '✅ Merged - ArgoCD sincronizará' : '⚠️ Erro'}
+              
+              🔄 ArgoCD detectará as mudanças e fará deploy automaticamente nos clusters.`
+            });
+
+  # Job 4: Build e Push Docker Image para Develop
+  deploy-develop:
+    name: Build & Deploy Develop
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment:
+      name: develop
+      url: https://develop.templateproject.com
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build aplicação
+        run: dotnet build --configuration Release
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=develop-latest
+            type=sha,prefix=develop-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update ArgoCD Image Tag
+        run: |
+          echo "🔄 Atualizando tag da imagem no repositório GitOps..."
+          # Atualiza o arquivo de manifests com a nova tag
+          IMAGE_TAG="develop-${{ github.sha }}"
+          echo "Nova tag: $IMAGE_TAG"
+          
+          # Se você tem um repositório GitOps separado, faça o update lá
+          # Exemplo: atualizar kustomization.yaml ou values.yaml
+
+      - name: Trigger ArgoCD Sync
+        uses: clowdhaus/argo-cd-action/@main
+        with:
+          command: app sync templateproject-develop
+          options: --prune --force
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+
+      - name: Wait for ArgoCD Deployment
+        uses: clowdhaus/argo-cd-action/@main
+        with:
+          command: app wait templateproject-develop
+          options: --health --timeout 300
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+
+  # Job 5: Build e Push Docker Image para Staging
+  deploy-staging:
+    name: Build & Deploy Staging
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
+    environment:
+      name: staging
+      url: https://staging.templateproject.com
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build aplicação
+        run: dotnet build --configuration Release
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=staging-latest
+            type=sha,prefix=staging-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update ArgoCD Image Tag
+        run: |
+          echo "🔄 Atualizando tag da imagem no repositório GitOps..."
+          IMAGE_TAG="staging-${{ github.sha }}"
+          echo "Nova tag: $IMAGE_TAG"
+
+      - name: Trigger ArgoCD Sync
+        uses: clowdhaus/argo-cd-action/@main
+        with:
+          command: app sync templateproject-staging
+          options: --prune --force
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+
+      - name: Wait for ArgoCD Deployment
+        uses: clowdhaus/argo-cd-action/@main
+        with:
+          command: app wait templateproject-staging
+          options: --health --timeout 300
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+
+  # Job 6: Build e Push Docker Image para Production
+  deploy-production:
+    name: Build & Deploy Production
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://api.templateproject.com
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build aplicação
+        run: dotnet build --configuration Release
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=semver,pattern={{version}}
+            type=sha,prefix=prod-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            ## 🚀 Deploy em Produção via ArgoCD
+            
+            **Build:** #${{ github.run_number }}
+            **Commit:** ${{ github.sha }}
+            **Docker Image:** ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-${{ github.sha }}
+            
+            ### 📦 Artefatos:
+            - Imagem Docker publicada no GHCR
+            - Deploy automático via ArgoCD
+          draft: false
+          prerelease: false
+
+      - name: Update ArgoCD Image Tag
+        run: |
+          echo "🔄 Atualizando tag da imagem no repositório GitOps..."
+          IMAGE_TAG="prod-${{ github.sha }}"
+          echo "Nova tag: $IMAGE_TAG"
+
+      - name: Trigger ArgoCD Sync
+        uses: clowdhaus/argo-cd-action/@main
+        with:
+          command: app sync templateproject-production
+          options: --prune --force
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+
+      - name: Wait for ArgoCD Deployment
+        uses: clowdhaus/argo-cd-action/@main
+        with:
+          command: app wait templateproject-production
+          options: --health --timeout 600
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+
+      - name: Notify Success
+        if: success()
+        run: |
+          echo "✅ Deploy em produção concluído com sucesso!"
+          echo "🔗 URL: https://api.templateproject.com"
+          echo "🐳 Imagem: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-${{ github.sha }}"
