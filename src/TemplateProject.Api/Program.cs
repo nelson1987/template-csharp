@@ -1,8 +1,15 @@
+using System.Text;
+using System.Text.Json;
+
 using DotNetEnv;
 
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
+
+using StackExchange.Redis;
 
 using TemplateProject.Api;
 
@@ -22,6 +29,12 @@ builder.Services.AddDbContext<AppDbContext>(opt =>
 
 builder.Services.AddScoped<IBookRepository, EfBookRepository>();
 builder.Services.AddScoped<IBookService, BookService>();
+builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
+{
+    var redisConn = builder.Configuration["REDIS_URL"] ?? "localhost:6379";
+    return ConnectionMultiplexer.Connect(redisConn);
+});
+builder.Services.AddSingleton<RedisCacheService>();
 builder.WebHost.UseUrls($"http://*:{port}");
 builder.Services.AddProblemDetails();
 builder.Services.AddHealthChecks();
@@ -59,12 +72,51 @@ builder.Services.AddSwaggerGen(c =>
             }
         }
     });
+    c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        In = ParameterLocation.Header,
+        Description = "JWT Token (ex: Bearer eyJ...)",
+        Name = "Authorization",
+        Type = SecuritySchemeType.ApiKey,
+        Scheme = "Bearer"
+    });
+    c.AddSecurityRequirement(new OpenApiSecurityRequirement
+    {
+        {
+            new OpenApiSecurityScheme
+            {
+                Reference = new OpenApiReference
+                {
+                    Type = ReferenceType.SecurityScheme,
+                    Id = "Bearer"
+                }
+            },
+            new string[] {}
+        }
+    });
 });
-// builder.Services.AddAuthentication()
-//     .AddJwtBearer();
-// builder.Services.AddAuthorization(o => {
-//     o.AddPolicy("ApiTesterPolicy", b => b.RequireRole("tester"));
-// });
+var jwtKey = builder.Configuration["JWT_KEY"] ?? "super_secret_key_for_demo";
+var key = Encoding.ASCII.GetBytes(jwtKey);
+
+builder.Services.AddAuthentication(options =>
+    {
+        options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+        options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+    })
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(key),
+            ValidateIssuer = false,
+            ValidateAudience = false,
+            ValidateLifetime = true
+        };
+    });
+
+builder.Services.AddAuthorization();
+
 var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
@@ -78,8 +130,8 @@ app.UseSwaggerUI(c =>
     c.SwaggerEndpoint("/swagger/v1/swagger.json", "Books Minimal API v1");
     c.RoutePrefix = string.Empty; // Swagger abre na raiz
 });
-// app.UseAuthentication();
-// app.UseAuthorization();
+app.UseAuthentication();
+app.UseAuthorization();
 app.UseHttpsRedirection();
 app.UseHealthChecks("/health", new HealthCheckOptions
 {
@@ -96,7 +148,31 @@ app.UseHealthChecks("/health", new HealthCheckOptions
         await context.Response.WriteAsJsonAsync(result);
     }
 });
+
 app.MapGet("/ping", () => Results.Ok("pong"));
+
+app.MapPost("/login", (string username, string password) =>
+{
+    // Demo simples: qualquer usuário com senha "123" é aceito
+    if (string.IsNullOrWhiteSpace(username) || password != "123")
+        return Results.Unauthorized();
+
+    var tokenHandler = new System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler();
+    var key = Encoding.ASCII.GetBytes(jwtKey);
+
+    var tokenDescriptor = new SecurityTokenDescriptor
+    {
+        Subject = new System.Security.Claims.ClaimsIdentity(new[]
+        {
+            new System.Security.Claims.Claim("sub", username)
+        }),
+        Expires = DateTime.UtcNow.AddHours(1),
+        SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
+    };
+
+    var token = tokenHandler.CreateToken(tokenDescriptor);
+    return Results.Ok(new { token = tokenHandler.WriteToken(token) });
+});
 
 app.MapGet("/books", async (IBookService s) =>
         Results.Ok(await s.GetAllAsync()))
@@ -287,5 +363,25 @@ namespace TemplateProject.Api
         }
 
         public Task<bool> DeleteAsync(int id) => repo.DeleteAsync(id);
+    }
+
+    public class RedisCacheService
+    {
+        private readonly IDatabase _db;
+        public RedisCacheService(IConnectionMultiplexer mux) => _db = mux.GetDatabase();
+
+        public async Task<T?> GetAsync<T>(string key)
+        {
+            var val = await _db.StringGetAsync(key);
+            return val.HasValue ? JsonSerializer.Deserialize<T>(val!) : default;
+        }
+
+        public async Task SetAsync<T>(string key, T value, TimeSpan ttl)
+        {
+            var json = JsonSerializer.Serialize(value);
+            await _db.StringSetAsync(key, json, ttl);
+        }
+
+        public Task RemoveAsync(string key) => _db.KeyDeleteAsync(key);
     }
 }
