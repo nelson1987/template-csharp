@@ -1,0 +1,621 @@
+name: Multi-Environment CI/CD
+
+on:
+  pull_request:
+    branches:
+      - main
+      - staging
+      - develop
+    types: [opened, synchronize, reopened, closed, edited]
+  
+  push:
+    branches:
+      - main
+      - staging
+      - develop
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  PROJECT_PATH: './src/YourApi/YourApi.csproj'
+  TEST_PATH: './tests/YourApi.Tests/YourApi.Tests.csproj'
+
+jobs:
+  # Job 1: Build e Testes
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Executar testes unitários
+        run: dotnet test ${{ env.TEST_PATH }} --no-restore --verbosity normal --logger "trx;LogFileName=test-results.trx" /p:CollectCoverage=true /p:CoverageReportsFolder=./coverage
+
+      - name: Publicar resultados dos testes
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test Results
+          path: '**/test-results.trx'
+          reporter: dotnet-trx
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        if: always()
+        with:
+          files: ./coverage/coverage.cobertura.xml
+          flags: unittests
+          name: codecov-umbrella
+
+  # Job 2: Criar/Atualizar PRs automáticos em cascata
+  manage-cascade-prs:
+    name: Gerenciar PRs em Cascata
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' && 
+      github.base_ref == 'main' && 
+      (github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened')
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Verificar PRs existentes e fechar se necessário
+        uses: actions/github-script@v7
+        id: check_existing
+        with:
+          script: |
+            const branchName = context.payload.pull_request.head.ref;
+            const prNumber = context.payload.pull_request.number;
+            
+            // Buscar todos os PRs abertos
+            const { data: allPrs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+            
+            // Buscar PRs automáticos relacionados à branch atual
+            const stagingPR = allPrs.find(pr => 
+              pr.head.ref === `staging-from-${branchName}` && 
+              pr.base.ref === 'staging' &&
+              pr.labels.some(label => label.name === 'auto-created')
+            );
+            
+            const developPR = allPrs.find(pr => 
+              pr.head.ref === `develop-from-${branchName}` && 
+              pr.base.ref === 'develop' &&
+              pr.labels.some(label => label.name === 'auto-created')
+            );
+            
+            // Verificar se algum PR foi mergeado
+            let stagingMerged = false;
+            let developMerged = false;
+            
+            if (stagingPR && stagingPR.merged_at) {
+              stagingMerged = true;
+            }
+            
+            if (developPR && developPR.merged_at) {
+              developMerged = true;
+            }
+            
+            // Se algum PR foi mergeado, fechar e comentar
+            if (stagingPR && stagingMerged) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: stagingPR.number,
+                body: `⚠️ Este PR foi fechado porque o PR #${prNumber} foi atualizado. Um novo PR será criado automaticamente.`
+              });
+            }
+            
+            if (developPR && developMerged) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: developPR.number,
+                body: `⚠️ Este PR foi fechado porque o PR #${prNumber} foi atualizado. Um novo PR será criado automaticamente.`
+              });
+            }
+            
+            core.setOutput('staging_pr_number', stagingPR ? stagingPR.number : '');
+            core.setOutput('develop_pr_number', developPR ? developPR.number : '');
+            core.setOutput('staging_merged', stagingMerged);
+            core.setOutput('develop_merged', developMerged);
+            core.setOutput('needs_new_prs', stagingMerged || developMerged);
+
+      - name: Atualizar ou criar branch staging
+        id: staging
+        run: |
+          BRANCH_NAME="${{ github.head_ref }}"
+          STAGING_BRANCH="staging-from-${BRANCH_NAME}"
+          
+          # Buscar últimas alterações
+          git fetch origin staging
+          git fetch origin $BRANCH_NAME
+          
+          # Verificar se a branch já existe
+          if git ls-remote --heads origin $STAGING_BRANCH | grep -q $STAGING_BRANCH; then
+            echo "Branch staging existe, atualizando..."
+            git checkout -B $STAGING_BRANCH origin/$STAGING_BRANCH
+          else
+            echo "Criando nova branch staging..."
+            git checkout -B $STAGING_BRANCH origin/staging
+          fi
+          
+          # Fazer merge das alterações mais recentes
+          git merge origin/$BRANCH_NAME --no-ff -m "chore: sync $BRANCH_NAME into staging" || {
+            echo "Conflito detectado, forçando merge"
+            git merge --abort || true
+            git checkout -B $STAGING_BRANCH origin/staging
+            git merge origin/$BRANCH_NAME --no-ff --strategy-option=theirs -m "chore: sync $BRANCH_NAME into staging"
+          }
+          
+          git push origin $STAGING_BRANCH --force
+          echo "staging_branch=$STAGING_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Atualizar ou criar branch develop
+        id: develop
+        run: |
+          BRANCH_NAME="${{ github.head_ref }}"
+          DEVELOP_BRANCH="develop-from-${BRANCH_NAME}"
+          
+          # Buscar últimas alterações
+          git fetch origin develop
+          git fetch origin $BRANCH_NAME
+          
+          # Verificar se a branch já existe
+          if git ls-remote --heads origin $DEVELOP_BRANCH | grep -q $DEVELOP_BRANCH; then
+            echo "Branch develop existe, atualizando..."
+            git checkout -B $DEVELOP_BRANCH origin/$DEVELOP_BRANCH
+          else
+            echo "Criando nova branch develop..."
+            git checkout -B $DEVELOP_BRANCH origin/develop
+          fi
+          
+          # Fazer merge das alterações mais recentes
+          git merge origin/$BRANCH_NAME --no-ff -m "chore: sync $BRANCH_NAME into develop" || {
+            echo "Conflito detectado, forçando merge"
+            git merge --abort || true
+            git checkout -B $DEVELOP_BRANCH origin/develop
+            git merge origin/$BRANCH_NAME --no-ff --strategy-option=theirs -m "chore: sync $BRANCH_NAME into develop"
+          }
+          
+          git push origin $DEVELOP_BRANCH --force
+          echo "develop_branch=$DEVELOP_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Criar ou atualizar PR para Staging
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branchName = context.payload.pull_request.head.ref;
+            const stagingBranch = '${{ steps.staging.outputs.staging_branch }}';
+            const prNumber = context.payload.pull_request.number;
+            const stagingPRNumber = '${{ steps.check_existing.outputs.staging_pr_number }}';
+            const stagingMerged = '${{ steps.check_existing.outputs.staging_merged }}' === 'true';
+            
+            const prBody = `## 🟡 Deploy para Staging
+            
+            Este PR foi criado/atualizado automaticamente a partir de: #${prNumber}
+            
+            **Branch original:** \`${branchName}\`
+            **Autor original:** @${{ github.event.pull_request.user.login }}
+            **Última atualização:** ${new Date().toISOString()}
+            
+            ### Descrição Original:
+            ${{ github.event.pull_request.body }}
+            
+            ---
+            
+            ${stagingMerged ? '⚠️ **Este é um NOVO PR criado após merge anterior**\n\n' : ''}
+            ⚠️ **Este PR será mergeado automaticamente após aprovação do PR para MAIN**
+            
+            ### Checklist de Deploy - Staging
+            - [ ] Testes passando
+            - [ ] Revisão de código concluída
+            - [ ] Variáveis de ambiente configuradas`;
+            
+            if (stagingPRNumber && !stagingMerged) {
+              // Atualizar PR existente
+              console.log(`Atualizando PR #${stagingPRNumber} para staging...`);
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: parseInt(stagingPRNumber),
+                body: prBody
+              });
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt(stagingPRNumber),
+                body: `🔄 **PR atualizado automaticamente**\n\nAs alterações do PR #${prNumber} foram sincronizadas.\n\n**Commit mais recente:** ${context.payload.pull_request.head.sha.substring(0, 7)}`
+              });
+            } else {
+              // Criar novo PR
+              console.log('Criando novo PR para staging...');
+              const { data: newPR } = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🟡 [STAGING] ${{ github.event.pull_request.title }}`,
+                head: stagingBranch,
+                base: 'staging',
+                body: prBody
+              });
+              
+              // Adicionar labels
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: newPR.number,
+                labels: ['staging', 'auto-created', `source-pr-${prNumber}`]
+              });
+              
+              console.log(`Novo PR #${newPR.number} criado para staging`);
+            }
+
+      - name: Criar ou atualizar PR para Develop
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branchName = context.payload.pull_request.head.ref;
+            const developBranch = '${{ steps.develop.outputs.develop_branch }}';
+            const prNumber = context.payload.pull_request.number;
+            const developPRNumber = '${{ steps.check_existing.outputs.develop_pr_number }}';
+            const developMerged = '${{ steps.check_existing.outputs.develop_merged }}' === 'true';
+            
+            const prBody = `## 🟢 Deploy para Develop
+            
+            Este PR foi criado/atualizado automaticamente a partir de: #${prNumber}
+            
+            **Branch original:** \`${branchName}\`
+            **Autor original:** @${{ github.event.pull_request.user.login }}
+            **Última atualização:** ${new Date().toISOString()}
+            
+            ### Descrição Original:
+            ${{ github.event.pull_request.body }}
+            
+            ---
+            
+            ${developMerged ? '⚠️ **Este é um NOVO PR criado após merge anterior**\n\n' : ''}
+            ⚠️ **Este PR será mergeado automaticamente após aprovação do PR para MAIN**
+            
+            ### Checklist de Deploy - Develop
+            - [ ] Testes passando
+            - [ ] Build bem sucedido`;
+            
+            if (developPRNumber && !developMerged) {
+              // Atualizar PR existente
+              console.log(`Atualizando PR #${developPRNumber} para develop...`);
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: parseInt(developPRNumber),
+                body: prBody
+              });
+              
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt(developPRNumber),
+                body: `🔄 **PR atualizado automaticamente**\n\nAs alterações do PR #${prNumber} foram sincronizadas.\n\n**Commit mais recente:** ${context.payload.pull_request.head.sha.substring(0, 7)}`
+              });
+            } else {
+              // Criar novo PR
+              console.log('Criando novo PR para develop...');
+              const { data: newPR } = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `🟢 [DEVELOP] ${{ github.event.pull_request.title }}`,
+                head: developBranch,
+                base: 'develop',
+                body: prBody
+              });
+              
+              // Adicionar labels
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: newPR.number,
+                labels: ['develop', 'auto-created', `source-pr-${prNumber}`]
+              });
+              
+              console.log(`Novo PR #${newPR.number} criado para develop`);
+            }
+
+      - name: Atualizar comentário no PR original
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const branchName = context.payload.pull_request.head.ref;
+            const action = context.payload.action;
+            const needsNewPRs = '${{ steps.check_existing.outputs.needs_new_prs }}' === 'true';
+            
+            // Buscar comentários existentes do bot
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes('PRs Automáticos')
+            );
+            
+            let commentBody = `## 🤖 PRs Automáticos ${needsNewPRs ? 'Recriados' : action === 'opened' ? 'Criados' : 'Atualizados'}
+            
+            ${needsNewPRs ? '⚠️ **Novos PRs foram criados porque os anteriores foram mergeados**\n\n' : ''}
+            
+            Os seguintes PRs foram ${needsNewPRs ? 'recriados' : action === 'opened' ? 'criados' : 'atualizados'} automaticamente:
+            
+            - 🟢 **Develop:** \`develop-from-${branchName}\`
+            - 🟡 **Staging:** \`staging-from-${branchName}\`
+            - 🔴 **Main:** Este PR (atual)
+            
+            ### Status:
+            - ✅ Branches sincronizadas com as últimas alterações
+            - ✅ Testes executados
+            - ⏳ Aguardando aprovação
+            
+            **Última sincronização:** ${new Date().toISOString()}
+            
+            ---
+            
+            💡 **Dica:** Se você fizer novas alterações neste PR, todos os PRs relacionados serão atualizados automaticamente.
+            
+            Quando este PR for aprovado e mergeado, os demais ambientes serão atualizados em cascata.`;
+            
+            if (botComment) {
+              // Atualizar comentário existente
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: commentBody
+              });
+            } else {
+              // Criar novo comentário
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: commentBody
+              });
+            }
+
+  # Job 3: Merge automático em cascata após aprovação
+  auto-merge-cascade:
+    name: Merge Automático em Cascata
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.base_ref == 'main'
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Buscar e mergear PRs relacionados
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branchName = context.payload.pull_request.head.ref;
+            const prNumber = context.payload.pull_request.number;
+            
+            // Buscar PRs relacionados usando a label source-pr
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+            
+            // Filtrar PRs criados automaticamente com a label correta
+            const stagingPR = prs.find(pr => 
+              pr.labels.some(label => label.name === `source-pr-${prNumber}`) &&
+              pr.base.ref === 'staging'
+            );
+            
+            const developPR = prs.find(pr => 
+              pr.labels.some(label => label.name === `source-pr-${prNumber}`) &&
+              pr.base.ref === 'develop'
+            );
+            
+            let stagingMerged = false;
+            let developMerged = false;
+            
+            // Mergear PR de Staging
+            if (stagingPR) {
+              console.log(`Mergeando PR #${stagingPR.number} para staging...`);
+              try {
+                await github.rest.pulls.merge({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: stagingPR.number,
+                  merge_method: 'merge',
+                  commit_title: `chore: auto-merge staging from main PR #${prNumber}`,
+                  commit_message: 'Merge automático após aprovação do PR para main'
+                });
+                console.log('✅ Staging merged com sucesso');
+                stagingMerged = true;
+              } catch (error) {
+                console.log(`⚠️ Erro ao mergear staging: ${error.message}`);
+              }
+            }
+            
+            // Mergear PR de Develop
+            if (developPR) {
+              console.log(`Mergeando PR #${developPR.number} para develop...`);
+              try {
+                await github.rest.pulls.merge({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: developPR.number,
+                  merge_method: 'merge',
+                  commit_title: `chore: auto-merge develop from main PR #${prNumber}`,
+                  commit_message: 'Merge automático após aprovação do PR para main'
+                });
+                console.log('✅ Develop merged com sucesso');
+                developMerged = true;
+              } catch (error) {
+                console.log(`⚠️ Erro ao mergear develop: ${error.message}`);
+              }
+            }
+            
+            // Adicionar comentário no PR original
+            await github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ✅ Deploy em Cascata Concluído
+              
+              Os seguintes ambientes foram atualizados:
+              - 🔴 **Main (Produção):** ✅ Merged
+              - 🟡 **Staging:** ${stagingPR ? (stagingMerged ? '✅ Merged automaticamente' : '⚠️ Erro no merge - verifique conflitos') : '⚠️ Não encontrado'}
+              - 🟢 **Develop:** ${developPR ? (developMerged ? '✅ Merged automaticamente' : '⚠️ Erro no merge - verifique conflitos') : '⚠️ Não encontrado'}
+              
+              Os deploys para cada ambiente serão executados automaticamente.
+              
+              **PRs processados:**
+              ${stagingPR ? `- Staging: #${stagingPR.number}` : ''}
+              ${developPR ? `- Develop: #${developPR.number}` : ''}`
+            });
+
+  # Job 4: Deploy Develop
+  deploy-develop:
+    name: Deploy Develop
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment:
+      name: develop
+      url: https://develop.yourapi.com
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build
+        run: dotnet build --configuration Release
+
+      - name: Publish
+        run: dotnet publish ${{ env.PROJECT_PATH }} -c Release -o ./publish
+
+      - name: Deploy para Develop
+        run: |
+          echo "🟢 Deploying para ambiente de DESENVOLVIMENTO..."
+          echo "URL: https://develop.yourapi.com"
+          # Adicione aqui seus comandos de deploy para develop
+
+  # Job 5: Deploy Staging
+  deploy-staging:
+    name: Deploy Staging
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
+    environment:
+      name: staging
+      url: https://staging.yourapi.com
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build
+        run: dotnet build --configuration Release
+
+      - name: Publish
+        run: dotnet publish ${{ env.PROJECT_PATH }} -c Release -o ./publish
+
+      - name: Deploy para Staging
+        run: |
+          echo "🟡 Deploying para ambiente de HOMOLOGAÇÃO..."
+          echo "URL: https://staging.yourapi.com"
+          # Adicione aqui seus comandos de deploy para staging
+
+  # Job 6: Deploy Production
+  deploy-production:
+    name: Deploy Production
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://api.yourapi.com
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build
+        run: dotnet build --configuration Release
+
+      - name: Publish
+        run: dotnet publish ${{ env.PROJECT_PATH }} -c Release -o ./publish
+
+      - name: Criar Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            ## 🚀 Deploy em Produção
+            
+            **Build:** #${{ github.run_number }}
+            **Commit:** ${{ github.sha }}
+            **Data:** ${{ github.event.head_commit.timestamp }}
+            
+            ### Mudanças:
+            ${{ github.event.head_commit.message }}
+          draft: false
+          prerelease: false
+
+      - name: Deploy para Production
+        run: |
+          echo "🔴 Deploying para PRODUÇÃO..."
+          echo "URL: https://api.yourapi.com"
+          # Adicione aqui seus comandos de deploy para produção
