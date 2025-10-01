@@ -127,10 +127,7 @@ builder.Services.AddScoped<SqsConsumer>();
 
 builder.Services.AddSingleton<IAmazonDynamoDB>(sp =>
 {
-    var cfg = new AmazonDynamoDBConfig
-    {
-        ServiceURL = builder.Configuration["DYNAMO_URL"] ?? "http://localhost:4566"
-    };
+    var cfg = new AmazonDynamoDBConfig { ServiceURL = builder.Configuration["DYNAMO_URL"] ?? "http://localhost:4566" };
     return new AmazonDynamoDBClient("test", "test", cfg);
 });
 builder.Services.AddScoped<DynamoBookRepository>();
@@ -228,19 +225,33 @@ app.MapGet("/books/{id:int}", async (int id, IBookService s) =>
 //     .WithName("CreateBook")
 //     .WithOpenApi(op => new(op) { Summary = "Criar novo livro", Description = "Cadastra um novo livro no sistema.", })
 //     .RequireAuthorization();
-app.MapPost("/books", async (Book book, DynamoBookRepository dynamoRepo, SqsPublisher publisher) =>
-{
-    // salva no Dynamo
-    await dynamoRepo.SaveAsync(book);
+app.MapPost("/books", async (
+        HttpContext context, Book book, DynamoBookRepository dynamoRepo, SqsPublisher publisher,
+    IdempotencyService idempotencyService) =>
+    {
+        // Pegar chave do header
+        var idemKey = context.Request.Headers["Idempotency-Key"].FirstOrDefault();
+        if (string.IsNullOrEmpty(idemKey))
+            return Results.BadRequest("Missing Idempotency-Key header");
 
-    // publica evento
-    await publisher.PublishAsync(book);
+        // Checar no Redis se já foi processado
+        var (exists, cachedResult) = await idempotencyService.CheckAsync<Book>(idemKey);
+        if (exists)
+            return Results.Ok(cachedResult);
 
-    return Results.Accepted($"/books/{book.Id}", new { message = "Book accepted and queued for processing" });
-})
-     .WithName("CreateBook")
-     .WithOpenApi(op => new(op) { Summary = "Criar novo livro", Description = "Cadastra um novo livro no sistema.", })
-     .RequireAuthorization();
+        // salva no Dynamo
+        await dynamoRepo.SaveAsync(book);
+
+        // publica evento
+        await publisher.PublishAsync(book);
+
+        // Salvar no Redis como resposta já processada
+        await idempotencyService.SaveAsync(idemKey, book);
+        return Results.Accepted($"/books/{book.Id}", new { message = "Book accepted and queued for processing" });
+    })
+    .WithName("CreateBook")
+    .WithOpenApi(op => new(op) { Summary = "Criar novo livro", Description = "Cadastra um novo livro no sistema.", })
+    .RequireAuthorization();
 
 app.MapPut("/books/{id:int}", async (int id, Book book, IBookService s) =>
     {
@@ -536,6 +547,33 @@ namespace TemplateProject.Api
 
                 await Task.Delay(1000, stoppingToken);
             }
+        }
+    }
+
+    public class IdempotencyService
+    {
+        private readonly IDatabase _redis;
+
+        public IdempotencyService(IConnectionMultiplexer connection)
+        {
+            _redis = connection.GetDatabase();
+        }
+
+        public async Task<(bool Exists, T? Result)> CheckAsync<T>(string key)
+        {
+            var cached = await _redis.StringGetAsync(key);
+            if (cached.HasValue)
+            {
+                return (true, JsonSerializer.Deserialize<T>(cached!)!);
+            }
+
+            return (false, default);
+        }
+
+        public async Task SaveAsync<T>(string key, T result, TimeSpan? expiration = null)
+        {
+            var data = JsonSerializer.Serialize(result);
+            await _redis.StringSetAsync(key, data, expiration ?? TimeSpan.FromHours(1));
         }
     }
 }
