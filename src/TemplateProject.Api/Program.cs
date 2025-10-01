@@ -1,6 +1,8 @@
 using System.Text;
 using System.Text.Json;
 
+using Amazon.DynamoDBv2;
+using Amazon.DynamoDBv2.DataModel;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 
@@ -60,41 +62,32 @@ builder.Services.AddSwaggerGen(c =>
             ["id"] =
                 new OpenApiSchema { Type = "integer", Example = new Microsoft.OpenApi.Any.OpenApiInteger(1) },
             ["title"] =
-                new OpenApiSchema
-                {
-                    Type = "string", Example = new Microsoft.OpenApi.Any.OpenApiString("Clean Code")
-                },
+                new OpenApiSchema { Type = "string", Example = new Microsoft.OpenApi.Any.OpenApiString("Clean Code") },
             ["author"] =
                 new OpenApiSchema
                 {
                     Type = "string", Example = new Microsoft.OpenApi.Any.OpenApiString("Robert C. Martin")
                 },
-            ["year"] = new OpenApiSchema
-            {
-                Type = "integer", Example = new Microsoft.OpenApi.Any.OpenApiInteger(2008)
-            }
+            ["year"] = new OpenApiSchema { Type = "integer", Example = new Microsoft.OpenApi.Any.OpenApiInteger(2008) }
         }
     });
-    c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
-    {
-        In = ParameterLocation.Header,
-        Description = "JWT Token (ex: Bearer eyJ...)",
-        Name = "Authorization",
-        Type = SecuritySchemeType.ApiKey,
-        Scheme = "Bearer"
-    });
+    c.AddSecurityDefinition("Bearer",
+        new OpenApiSecurityScheme
+        {
+            In = ParameterLocation.Header,
+            Description = "JWT Token (ex: Bearer eyJ...)",
+            Name = "Authorization",
+            Type = SecuritySchemeType.ApiKey,
+            Scheme = "Bearer"
+        });
     c.AddSecurityRequirement(new OpenApiSecurityRequirement
     {
         {
             new OpenApiSecurityScheme
             {
-                Reference = new OpenApiReference
-                {
-                    Type = ReferenceType.SecurityScheme,
-                    Id = "Bearer"
-                }
+                Reference = new OpenApiReference { Type = ReferenceType.SecurityScheme, Id = "Bearer" }
             },
-            new string[] {}
+            new string[] { }
         }
     });
 });
@@ -132,6 +125,17 @@ builder.Services.AddSingleton<IAmazonSQS>(sp =>
 builder.Services.AddScoped<SqsPublisher>();
 builder.Services.AddScoped<SqsConsumer>();
 
+builder.Services.AddSingleton<IAmazonDynamoDB>(sp =>
+{
+    var cfg = new AmazonDynamoDBConfig
+    {
+        ServiceURL = builder.Configuration["DYNAMO_URL"] ?? "http://localhost:4566"
+    };
+    return new AmazonDynamoDBClient("test", "test", cfg);
+});
+builder.Services.AddScoped<DynamoBookRepository>();
+
+builder.Services.AddHostedService<BookConsumerService>();
 var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
@@ -177,12 +181,11 @@ app.MapPost("/login", (string username, string password) =>
 
     var tokenDescriptor = new SecurityTokenDescriptor
     {
-        Subject = new System.Security.Claims.ClaimsIdentity(new[]
-        {
-            new System.Security.Claims.Claim("sub", username)
-        }),
+        Subject =
+            new System.Security.Claims.ClaimsIdentity(new[] { new System.Security.Claims.Claim("sub", username) }),
         Expires = DateTime.UtcNow.AddHours(1),
-        SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
+        SigningCredentials =
+            new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
     };
 
     var token = tokenHandler.CreateToken(tokenDescriptor);
@@ -210,21 +213,34 @@ app.MapGet("/books/{id:int}", async (int id, IBookService s) =>
         Description = "Retorna o livro específico pelo seu ID."
     });
 
-app.MapPost("/books", async (Book book, IBookService s, RedisCacheService cache, SqsPublisher publisher) =>
-    {
-        var created = await s.CreateAsync(book);
+// app.MapPost("/books", async (Book book, IBookService s, RedisCacheService cache, SqsPublisher publisher) =>
+//     {
+//         var created = await s.CreateAsync(book);
+//
+//         if (created.IsFailure) Results.BadRequest(new { created.Errors });
+//
+//         await cache.RemoveAsync("books_all");
+//
+//         await publisher.PublishAsync(new { Action = "BookCreated", Book = created });
+//
+//         return Results.Created($"/books/{created!.Value!.Id}", created);
+//     })
+//     .WithName("CreateBook")
+//     .WithOpenApi(op => new(op) { Summary = "Criar novo livro", Description = "Cadastra um novo livro no sistema.", })
+//     .RequireAuthorization();
+app.MapPost("/books", async (Book book, DynamoBookRepository dynamoRepo, SqsPublisher publisher) =>
+{
+    // salva no Dynamo
+    await dynamoRepo.SaveAsync(book);
 
-        if (created.IsFailure) Results.BadRequest(new { created.Errors });
+    // publica evento
+    await publisher.PublishAsync(book);
 
-        await cache.RemoveAsync("books_all");
-
-        await publisher.PublishAsync(new { Action = "BookCreated", Book = created });
-
-        return Results.Created($"/books/{created!.Value!.Id}", created);
-    })
-    .WithName("CreateBook")
-    .WithOpenApi(op => new(op) { Summary = "Criar novo livro", Description = "Cadastra um novo livro no sistema.", })
-    .RequireAuthorization();
+    return Results.Accepted($"/books/{book.Id}", new { message = "Book accepted and queued for processing" });
+})
+     .WithName("CreateBook")
+     .WithOpenApi(op => new(op) { Summary = "Criar novo livro", Description = "Cadastra um novo livro no sistema.", })
+     .RequireAuthorization();
 
 app.MapPut("/books/{id:int}", async (int id, Book book, IBookService s) =>
     {
@@ -253,12 +269,17 @@ namespace TemplateProject.Api
     {
     }
 
+    [DynamoDBTable("Books")]
     public class Book
     {
-        public int Id { get; set; } // PK
-        public string Title { get; set; } = default!;
-        public string Author { get; set; } = default!;
-        public int Year { get; set; }
+        [DynamoDBHashKey] // chave primária
+        public int Id { get; set; }
+
+        [DynamoDBProperty] public string Title { get; set; } = "";
+
+        [DynamoDBProperty] public string Author { get; set; } = "";
+
+        [DynamoDBProperty] public int Year { get; set; }
     }
 
     public class Result
@@ -458,6 +479,63 @@ namespace TemplateProject.Api
             }
 
             return bodies;
+        }
+    }
+
+    public class DynamoBookRepository
+    {
+        private readonly DynamoDBContext _context;
+
+        public DynamoBookRepository(IAmazonDynamoDB dynamoDb)
+        {
+            _context = new DynamoDBContext(dynamoDb);
+        }
+
+        public Task SaveAsync(Book book) => _context.SaveAsync(book);
+        public Task<Book?> GetAsync(int id) => _context.LoadAsync<Book>(id);
+    }
+
+    public class BookConsumerService : BackgroundService
+    {
+        private readonly SqsConsumer _consumer;
+        private readonly IServiceProvider _sp;
+        private readonly RedisCacheService _cache;
+
+        public BookConsumerService(SqsConsumer consumer, IServiceProvider sp, RedisCacheService cache)
+        {
+            _consumer = consumer;
+            _sp = sp;
+            _cache = cache;
+        }
+
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                var messages = await _consumer.ConsumeAsync();
+                foreach (var msg in messages)
+                {
+                    try
+                    {
+                        var book = JsonSerializer.Deserialize<Book>(msg);
+                        if (book is null) continue;
+
+                        using var scope = _sp.CreateScope();
+                        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                        db.Books.Add(book);
+                        await db.SaveChangesAsync(stoppingToken);
+
+                        await _cache.RemoveAsync("books_all");
+                        await _cache.SetAsync($"book_{book.Id}", book, TimeSpan.FromMinutes(5));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[BookConsumerService] Erro: {ex.Message}");
+                    }
+                }
+
+                await Task.Delay(1000, stoppingToken);
+            }
         }
     }
 }

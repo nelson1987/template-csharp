@@ -15,6 +15,7 @@
         <PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
         <PackageReference Include="StackExchange.Redis" Version="2.7.33" />
         <PackageReference Include="AWSSDK.SQS" Version="3.7.300.25" />
+        <PackageReference Include="AWSSDK.DynamoDBv2" Version="3.7.302.10" />
     </ItemGroup>
 
 </Project>
