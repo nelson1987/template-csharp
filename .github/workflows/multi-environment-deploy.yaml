@@ -44,27 +44,27 @@ jobs:
         run: dotnet restore
 
       - name: Build
-        run: dotnet build --configuration Release --no-restore
+        run: dotnet build --no-restore
 
       - name: Executar testes unitários
         run: dotnet test --no-build --verbosity normal
         #run: dotnet test ${{ env.TEST_PATH }} --no-restore --verbosity normal --logger "trx;LogFileName=test-results.trx" /p:CollectCoverage=true /p:CoverageReportsFolder=./coverage
 
-      - name: Publicar resultados dos testes
-        uses: dorny/test-reporter@v1
-        if: always()
-        with:
-          name: Test Results
-          path: "**/test-results.trx"
-          reporter: dotnet-trx
+      # - name: Publicar resultados dos testes
+      #   uses: dorny/test-reporter@v1
+      #   if: always()
+      #   with:
+      #     name: Test Results
+      #     path: "**/test-results.trx"
+      #     reporter: dotnet-trx
 
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
-        if: always()
-        with:
-          files: ./coverage/coverage.cobertura.xml
-          flags: unittests
-          name: codecov-umbrella
+      # - name: Upload coverage
+      #   uses: codecov/codecov-action@v3
+      #   if: always()
+      #   with:
+      #     files: ./coverage/coverage.cobertura.xml
+      #     flags: unittests
+      #     name: codecov-umbrella
 
   # Job 2: Criar/Atualizar PRs automáticos em cascata
   manage-cascade-prs:
