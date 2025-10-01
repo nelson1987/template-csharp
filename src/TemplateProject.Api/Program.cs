@@ -1,6 +1,9 @@
 using System.Text;
 using System.Text.Json;
 
+using Amazon.SQS;
+using Amazon.SQS.Model;
+
 using DotNetEnv;
 
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -117,6 +120,18 @@ builder.Services.AddAuthentication(options =>
 
 builder.Services.AddAuthorization();
 
+builder.Services.AddSingleton<IAmazonSQS>(sp =>
+{
+    var config = new AmazonSQSConfig
+    {
+        ServiceURL = builder.Configuration["SQS_SERVICE_URL"] ?? "http://localhost:4566"
+    };
+    return new AmazonSQSClient("test", "test", config); // credenciais fake para LocalStack
+});
+
+builder.Services.AddScoped<SqsPublisher>();
+builder.Services.AddScoped<SqsConsumer>();
+
 var app = builder.Build();
 using (var scope = app.Services.CreateScope())
 {
@@ -195,15 +210,21 @@ app.MapGet("/books/{id:int}", async (int id, IBookService s) =>
         Description = "Retorna o livro específico pelo seu ID."
     });
 
-app.MapPost("/books", async (Book book, IBookService s) =>
+app.MapPost("/books", async (Book book, IBookService s, RedisCacheService cache, SqsPublisher publisher) =>
     {
         var created = await s.CreateAsync(book);
-        return created.IsSuccess
-            ? Results.Created($"/books/{created!.Value!.Id}", created)
-            : Results.BadRequest(new { created.Errors });
+
+        if (created.IsFailure) Results.BadRequest(new { created.Errors });
+
+        await cache.RemoveAsync("books_all");
+
+        await publisher.PublishAsync(new { Action = "BookCreated", Book = created });
+
+        return Results.Created($"/books/{created!.Value!.Id}", created);
     })
     .WithName("CreateBook")
-    .WithOpenApi(op => new(op) { Summary = "Criar novo livro", Description = "Cadastra um novo livro no sistema.", });
+    .WithOpenApi(op => new(op) { Summary = "Criar novo livro", Description = "Cadastra um novo livro no sistema.", })
+    .RequireAuthorization();
 
 app.MapPut("/books/{id:int}", async (int id, Book book, IBookService s) =>
     {
@@ -383,5 +404,60 @@ namespace TemplateProject.Api
         }
 
         public Task RemoveAsync(string key) => _db.KeyDeleteAsync(key);
+    }
+
+    public class SqsPublisher
+    {
+        private readonly IAmazonSQS _sqs;
+        private readonly string _queueUrl;
+
+        public SqsPublisher(IAmazonSQS sqs, IConfiguration config)
+        {
+            _sqs = sqs;
+            _queueUrl = config["SQS_QUEUE_URL"] ?? throw new InvalidOperationException("SQS_QUEUE_URL not configured");
+        }
+
+        public async Task PublishAsync(object message)
+        {
+            var json = System.Text.Json.JsonSerializer.Serialize(message);
+
+            var request = new SendMessageRequest { QueueUrl = _queueUrl, MessageBody = json };
+
+            await _sqs.SendMessageAsync(request);
+        }
+    }
+
+    public class SqsConsumer
+    {
+        private readonly IAmazonSQS _sqs;
+        private readonly string _queueUrl;
+
+        public SqsConsumer(IAmazonSQS sqs, IConfiguration config)
+        {
+            _sqs = sqs;
+            _queueUrl = config["SQS_QUEUE_URL"] ?? throw new InvalidOperationException("SQS_QUEUE_URL not configured");
+        }
+
+        public async Task<List<string>> ConsumeAsync(int maxMessages = 5)
+        {
+            var request = new ReceiveMessageRequest
+            {
+                QueueUrl = _queueUrl,
+                MaxNumberOfMessages = maxMessages,
+                WaitTimeSeconds = 1
+            };
+
+            var response = await _sqs.ReceiveMessageAsync(request);
+
+            var bodies = response.Messages.Select(m => m.Body).ToList();
+
+            // Apaga após consumir
+            foreach (var msg in response.Messages)
+            {
+                await _sqs.DeleteMessageAsync(_queueUrl, msg.ReceiptHandle);
+            }
+
+            return bodies;
+        }
     }
 }
